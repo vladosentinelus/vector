@@ -244,6 +244,22 @@ pub enum ProcessingError {
     },
 }
 
+impl ProcessingError {
+    /// Whether retrying this error against the same SQS message is expected to succeed.
+    ///
+    /// A `GetObject` failure that the AWS SDK itself classifies as non-retriable (e.g. a
+    /// 404/`NoSuchKey`) will fail identically forever, since the object it's asking for will
+    /// never appear. Without this, such a message is never deleted, becomes visible again
+    /// after `visibility_timeout_secs`, and is re-fetched and re-failed on every poll cycle
+    /// indefinitely.
+    fn is_retriable(&self) -> bool {
+        match self {
+            ProcessingError::GetObject { source, .. } => crate::aws::is_retriable_error(source),
+            _ => true,
+        }
+    }
+}
+
 pub struct State {
     region: Region,
     sqs_client: SqsClient,
@@ -517,6 +533,25 @@ impl IngestorProcess {
                         message_id: &message_id,
                         error: &err,
                     });
+                    // A non-retriable failure (e.g. a 404/NoSuchKey GetObject error) will
+                    // fail identically forever if left on the queue: it becomes visible
+                    // again after the visibility timeout and is re-fetched and re-failed
+                    // every poll cycle, indefinitely. Delete it instead, same as we do for
+                    // sink-rejected messages via `delete_failed_message`.
+                    if self.state.delete_failed_message && !err.is_retriable() {
+                        trace!(
+                            message = "Queued non-retriable failed SQS message for deletion.",
+                            id = message_id,
+                            receipt_handle = receipt_handle,
+                        );
+                        delete_entries.push(
+                            DeleteMessageBatchRequestEntry::builder()
+                                .id(message_id)
+                                .receipt_handle(receipt_handle)
+                                .build()
+                                .expect("all required builder params specified"),
+                        );
+                    }
                 }
             }
         }
